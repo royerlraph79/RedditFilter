@@ -1,4 +1,4 @@
-name: Build Tweak
+name: Build Tweak (.deb)
 
 on:
   push:
@@ -8,90 +8,45 @@ jobs:
   build:
     runs-on: ubuntu-22.04
 
-    env:
-      THEOS: ${{ github.workspace }}/theos
-
     steps:
+      # Checkout repo
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # -----------------------------
-      # Cache Theos + SDKs
-      # -----------------------------
-      - name: Cache Theos
-        uses: actions/cache@v4
-        with:
-          path: |
-            theos
-          key: theos-${{ runner.os }}-v1
-
-      # -----------------------------
       # Install dependencies
-      # -----------------------------
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y \
-            clang \
-            lld \
-            make \
-            rsync \
-            git \
-            dpkg \
-            fakeroot \
-            build-essential
+          sudo apt install -y rsync
 
-      # -----------------------------
-      # Install Theos if cache miss
-      # -----------------------------
-      - name: Install Theos
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          git clone --recursive https://github.com/theos/theos.git $THEOS
+      # Setup Theos + SDKs (cached)
+      - name: Setup Theos
+        uses: level3tjg/theos-action@main
+        with:
+          cache: true
+          cache-dir-theos: ${{ github.workspace }}/theos
+          cache-dir-sdks: ${{ github.workspace }}/theos/sdks
 
-      # -----------------------------
-      # Export environment
-      # -----------------------------
-      - name: Setup environment
-        run: |
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
-          echo "$THEOS/bin" >> $GITHUB_PATH
+      # Build rootless package
+      - name: Build rootless deb
+        run: make package
+        env:
+          FINALPACKAGE: 1
+          THEOS_PACKAGE_SCHEME: rootless
 
-      # -----------------------------
-      # Build rootless tweak
-      # -----------------------------
-      - name: Build rootless package
-        run: make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-
-      # -----------------------------
-      # Build rootful tweak
-      # -----------------------------
-      - name: Build rootful package
+      # Build rootful package
+      - name: Build rootful deb
         run: |
           make clean
-          make package FINALPACKAGE=1
+          make package
+        env:
+          FINALPACKAGE: 1
 
-      # -----------------------------
-      # Extract dylib for sideload injection
-      # -----------------------------
-      - name: Extract dylib
-        run: |
-          mkdir artifacts
-          find .theos -name "*.dylib" -exec cp {} artifacts/ \;
-
-      # -----------------------------
       # Upload artifacts
-      # -----------------------------
-      - name: Upload packages
+      - name: Upload .deb packages
         uses: actions/upload-artifact@v4
         with:
-          name: deb-packages
+          name: redditfilter-debs
           path: packages/*.deb
-
-      - name: Upload dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: tweak-dylib
-          path: artifacts/*.dylib
