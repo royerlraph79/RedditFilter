@@ -1,134 +1,97 @@
-name: CI
+name: Build Tweak
 
 on:
   push:
   workflow_dispatch:
-    inputs:
-      create_release:
-        description: "Build IPA and create draft release"
-        default: false
-        type: boolean
-      ipa_url:
-        description: "Direct URL to Decrypted IPA file"
-        type: string
-        required: false
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Get package info
-        id: package_info
-        run: |
-          version=$(cat Makefile | grep "PACKAGE_VERSION =" | cut -d' ' -f3)
-          if [ -z $version ]; then
-            version=$(cat control | grep "Version:" | cut -d' ' -f2)
-          fi
-          echo "id=$(cat control | grep "Package:" | cut -d' ' -f2)" >> $GITHUB_OUTPUT
-          echo "version=$version" >> $GITHUB_OUTPUT
+      # -----------------------------
+      # Cache Theos + SDKs
+      # -----------------------------
+      - name: Cache Theos
+        uses: actions/cache@v4
+        with:
+          path: |
+            theos
+          key: theos-${{ runner.os }}-v1
 
+      # -----------------------------
+      # Install dependencies
+      # -----------------------------
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y rsync
+          sudo apt install -y \
+            clang \
+            lld \
+            make \
+            rsync \
+            git \
+            dpkg \
+            fakeroot \
+            build-essential
 
-      - name: Install theos-jailed dependencies
-        if: ${{ inputs.create_release }}
+      # -----------------------------
+      # Install Theos if cache miss
+      # -----------------------------
+      - name: Install Theos
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          sudo apt update
-          sudo apt install -y build-essential checkinstall git autoconf automake libtool-bin llvm xmlstarlet
-          curl -L https://github.com/libimobiledevice/libplist/releases/download/2.6.0/libplist-2.6.0.tar.bz2 | bzip2 -d | tar -x
-          cd libplist*
-          ./configure
-          sudo make install
-          sudo ldconfig
+          git clone --recursive https://github.com/theos/theos.git $THEOS
 
-      - name: Download IPA (Auto)
-        if: ${{ inputs.create_release && !inputs.ipa_url }}
-        uses: level3tjg/decryptedappstore-action@main
-        with:
-          appstore_url: "https://apps.apple.com/us/app/reddit/id1064216828"
-          cache: true
-          path: ${{ github.workspace }}/App.ipa
-          token: ${{ secrets.DECRYPTEDAPPSTORE_SESSION_TOKEN }}
-
-      - name: Download IPA (Manual)
-        if: ${{ inputs.create_release && inputs.ipa_url }}
+      # -----------------------------
+      # Export environment
+      # -----------------------------
+      - name: Setup environment
         run: |
-          curl -Lo "${{ github.workspace }}/App.ipa" "${{ inputs.ipa_url }}"
-          zip -T "${{ github.workspace }}/App.ipa"
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
 
-      - name: Get IPA Info
-        if: ${{ inputs.create_release }}
-        id: ipa_info
+      # -----------------------------
+      # Build rootless tweak
+      # -----------------------------
+      - name: Build rootless package
+        run: make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      # -----------------------------
+      # Build rootful tweak
+      # -----------------------------
+      - name: Build rootful package
         run: |
-          info=$(unzip -p "${{ github.workspace }}/App.ipa" Payload/*.app/Info.plist)
-          echo "bundle-id=$(echo $info | xmlstarlet sel -t -v "/plist/dict/key[text()=\"CFBundleIdentifier\"]/following-sibling::*[1]/text()")" >> $GITHUB_OUTPUT
-          echo "version=$(echo $info | xmlstarlet sel -t -v "/plist/dict/key[text()=\"CFBundleShortVersionString\"]/following-sibling::*[1]/text()")" >> $GITHUB_OUTPUT
+          make clean
+          make package FINALPACKAGE=1
 
-      - name: Setup theos
-        uses: level3tjg/theos-action@main
-        with:
-          cache: true
-          cache-dir-theos: ${{ github.workspace }}/theos
-          cache-dir-sdks: ${{ github.workspace }}/theos/sdks
-
-      - name: Checkout theos-jailed
-        if: ${{ inputs.create_release }}
-        uses: actions/checkout@v4
-        with:
-          repository: level3tjg/theos-jailed
-          path: theos-jailed
-          submodules: recursive
-
-      - name: Install theos-jailed
-        if: ${{ inputs.create_release }}
+      # -----------------------------
+      # Extract dylib for sideload injection
+      # -----------------------------
+      - name: Extract dylib
         run: |
-          ./theos-jailed/install
+          mkdir artifacts
+          find .theos -name "*.dylib" -exec cp {} artifacts/ \;
 
-      - name: Build rootless deb
-        run: make package
-        env:
-          FINALPACKAGE: ${{ inputs.create_release }}
-          THEOS_PACKAGE_SCHEME: rootless
-
-      - name: Build rootful deb
-        run: make clean package
-        env:
-          FINALPACKAGE: ${{ inputs.create_release }}
-
-      - name: Build IPA
-        if: ${{ inputs.create_release }}
-        run: make package
-        env:
-          FINALPACKAGE: 1
-          SIDELOADED: 1
-          IPA: ${{ github.workspace }}/App.ipa
-          APP_VERSION: ${{ steps.ipa_info.outputs.version }}
-
-      - name: Hash release files
-        id: hash_files
-        run: |
-          echo 'hashes<<EOF' >> $GITHUB_OUTPUT
-          echo "$(sha256sum packages/*)" >> $GITHUB_OUTPUT
-          echo 'EOF' >> $GITHUB_OUTPUT
-
-      - name: Upload artifacts
+      # -----------------------------
+      # Upload artifacts
+      # -----------------------------
+      - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package_info.outputs.id }}_${{ steps.package_info.outputs.version }}
-          path: packages/*
+          name: deb-packages
+          path: packages/*.deb
 
-      - name: Create release
-        if: ${{ inputs.create_release }}
-        uses: softprops/action-gh-release@v2
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
         with:
-          draft: true
-          files: packages/*
-          tag_name: v${{ steps.ipa_info.outputs.version }}-${{ steps.package_info.outputs.version }}
-          body: ${{ steps.hash_files.outputs.hashes }}
+          name: tweak-dylib
+          path: artifacts/*.dylib
